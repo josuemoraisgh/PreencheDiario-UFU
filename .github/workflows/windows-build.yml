@@ -12,6 +12,7 @@ permissions:
 jobs:
   build-win:
     runs-on: windows-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,62 +22,65 @@ jobs:
         with:
           python-version: '3.10'
           cache: 'pip'
-          cache-dependency-path: |
-            requirements.txt
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          if (Test-Path "requirements.txt") {
-            pip install -r requirements.txt
-          }
+          if (Test-Path requirements.txt) { pip install -r requirements.txt }
           pip install pyinstaller pyinstaller-hooks-contrib
 
       - name: Compute version
         shell: pwsh
         run: |
-          if ("${{ github.ref }}".StartsWith("refs/tags/")) {
-            $ver = "${{ github.ref_name }}"        # ex: v1.2.3
-          } else {
-            $ver = "dev-${{ github.run_number }}"
-          }
+          if ("${{ github.ref }}".StartsWith("refs/tags/")) { $ver = "${{ github.ref_name }}" }
+          else { $ver = "dev-${{ github.run_number }}" }
           "APP_VER=$ver" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Locate entry point
-        id: entry
         shell: pwsh
         run: |
-          # Procura main.py em locais comuns
-          $candidates = @(
-            "main.py",
-            "refactor_ui_single_responsibility\main.py",
-            "src\main.py",
-            "app\main.py"
-          )
-          $entry = $null
-          foreach ($c in $candidates) { if (Test-Path $c) { $entry = $c; break } }
-          if (-not $entry) {
-            Write-Host "Conteúdo do repositório:"
-            Get-ChildItem -Recurse -Depth 3 | Select-Object -First 200 | Format-Table
-            throw "Não encontrei o entry point (main.py). Ajuste a lista de candidatos neste passo."
-          }
+          if (Test-Path "main.py") { $entry="main.py" }
+          else { throw "Não encontrei main.py na raiz. Ajuste este passo." }
           "ENTRY=$entry" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "ENTRY => $entry"
 
-      - name: Build EXE with PyInstaller
+      - name: Build EXE (PyInstaller API, robusto)
         shell: pwsh
         run: |
           if (Test-Path build) { Remove-Item build -Recurse -Force }
           if (Test-Path dist)  { Remove-Item dist  -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path build | Out-Null
 
-          # usa ícone se existir
-          $ico = ""
-          if (Test-Path "assets\app.ico") { $ico = "-i assets\app.ico" }
+          $code = @'
+import os, sys
+import PyInstaller.__main__ as P
 
-          # chame SEMPRE via módulo para evitar wrappers estranhos
-          python -m PyInstaller --noconfirm --clean --onefile --windowed $ico `
-            -n "UFU-PreencheDiario-$env:APP_VER" "${{ env.ENTRY }}"
+ver  = os.environ.get("APP_VER","dev")
+name = f"UFU-PreencheDiario-{ver}"
+entry= os.environ.get("ENTRY","main.py")
+
+# Se houver um .spec, preferimos ele (já pode conter add-data, icon, etc.)
+spec_candidates = [fn for fn in os.listdir(".") if fn.lower().endswith(".spec")]
+if spec_candidates:
+    spec = spec_candidates[0]
+    print(">> Building from SPEC:", spec)
+    opts = [spec]
+else:
+    print(">> Building from script:", entry)
+    opts = ["--noconfirm","--clean","--onefile","--windowed","-n", name]
+    ico = os.path.join("assets","app.ico")
+    if os.path.exists(ico):
+        opts += ["-i", ico]
+    opts += [entry]
+
+print("PyInstaller options:", opts)
+P.run(opts)
+'@
+
+          Set-Content -Path build\run_pyi.py -Value $code -Encoding UTF8
+          python build\run_pyi.py
 
           Write-Host "Dist contents:"
           Get-ChildItem dist -Recurse | Format-Table -AutoSize
@@ -85,12 +89,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: UFU-PreencheDiario-${{ env.APP_VER }}-win
-          path: dist/UFU-PreencheDiario-${{ env.APP_VER }}.exe
+          path: dist/*.exe
           if-no-files-found: error
 
       - name: Publish GitHub Release (on tag)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/UFU-PreencheDiario-${{ env.APP_VER }}.exe
+          files: dist/*.exe
           generate_release_notes: true
