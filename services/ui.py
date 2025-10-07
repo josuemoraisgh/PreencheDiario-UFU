@@ -8,6 +8,8 @@ from tkinter import (
     Y, X, TOP, BOTTOM, filedialog, simpledialog, messagebox, Toplevel, Label, Entry, StringVar
 )
 from tkinter import ttk
+from openpyxl import load_workbook
+import unicodedata, datetime, re
 
 from selenium.webdriver.remote.webdriver import WebDriver
 
@@ -53,6 +55,10 @@ class App(Tk):
 
         self.btn_load_json = Button(top, text="Carregar Dados", command=self.on_load_json)
         self.btn_load_json.pack(side=LEFT, padx=4, pady=6)
+
+        self.btn_import_excel = Button(top, text="Importar Excel", command=self.on_import_excel)
+        self.btn_import_excel.pack(side=LEFT, padx=4, pady=6)
+
 
         # Main split
         main = Frame(self); main.pack(side=TOP, fill=BOTH, expand=True)
@@ -309,6 +315,170 @@ class App(Tk):
                 self._log(f"[ERRO] Falha no preenchimento: {e}")
 
         threading.Thread(target=_run, daemon=True).start()
+        
+    # ---------- Importação Excel ----------
+    def _strip_accents(self, s: str) -> str:
+        if not isinstance(s, str): 
+            return ""
+        return "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
+
+    def _norm_header(self, s: str) -> str:
+        s = self._strip_accents(s or "").lower().strip()
+        s = re.sub(r"\s+", " ", s)
+        return s
+
+    def _choose_from_list(self, title: str, options: list[str]) -> Optional[str]:
+        """Modal simples com Combobox para escolher um item de options."""
+        if not options:
+            return None
+        win = Toplevel(self)
+        win.title(title)
+        win.transient(self); win.grab_set()
+
+        Label(win, text=title).grid(row=0, column=0, padx=8, pady=(8,4), sticky="w")
+        var = StringVar(value=options[0])
+        cb = ttk.Combobox(win, textvariable=var, values=options, state="readonly", width=40)
+        cb.grid(row=1, column=0, padx=8, pady=4, sticky="we")
+
+        res = [None]
+        def _ok(): res[0] = var.get(); win.destroy()
+        def _cancel(): win.destroy()
+        btns = Frame(win); btns.grid(row=2, column=0, sticky="e", padx=8, pady=8)
+        Button(btns, text="Cancelar", command=_cancel).pack(side=RIGHT, padx=4)
+        Button(btns, text="OK", command=_ok).pack(side=RIGHT, padx=4)
+
+        win.columnconfigure(0, weight=1)
+        cb.focus_set()
+        self.wait_window(win)
+        return res[0]
+
+    def _find_header_row_and_map(self, ws, max_scan_rows: int = 10):
+        """Detecta linha de cabeçalho e retorna (header_row_idx, map_dict).
+        map_dict = {'data': col_idx, 'modalidade': col_idx, 'materia': col_idx}
+        """
+        wants = {"data": None, "modalidade": None, "materia": None}
+        for r in range(1, max_scan_rows+1):
+            row_vals = [self._norm_header((ws.cell(r, c).value or "")) for c in range(1, ws.max_column+1)]
+            # procure colunas
+            cand = {"data": None, "modalidade": None, "materia": None}
+            for c, hv in enumerate(row_vals, start=1):
+                if hv in ("data", "dia"):
+                    cand["data"] = c
+                elif hv.startswith("modalidade"):
+                    cand["modalidade"] = c
+                elif hv in ("materia lecionada", "materia", "conteudo", "conteudo lecionado", "descricao", "descrição"):
+                    cand["materia"] = c
+            if all(cand.values()):
+                return r, cand
+        # fallback: primeira linha
+        return 1, {"data": 1, "modalidade": 2, "materia": 4}
+
+    def _fmt_date_ddmmyyyy(self, val) -> Optional[str]:
+        """Aceita datetime/date ou string; retorna DD/MM/AAAA."""
+        if val is None or val == "":
+            return None
+        if isinstance(val, (datetime.date, datetime.datetime)):
+            return val.strftime("%d/%m/%Y")
+        s = str(val).strip()
+        s = re.sub(r"[^\d/]", "", s)  # mantém apenas dígitos e /
+        # tenta DD/MM/AAAA
+        m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{2,4})$", s)
+        if m:
+            d, mth, y = m.groups()
+            y = y.zfill(4) if len(y) == 4 else ("20" + y.zfill(2))
+            return f"{d.zfill(2)}/{mth.zfill(2)}/{y}"
+        return None
+
+    def _mod_to_suffix(self, mod: str) -> Optional[str]:
+        m = self._strip_accents((mod or "")).lower()
+        if "teor" in m:  # teórica
+            return "T"
+        if "prat" in m:  # prática
+            return "P"
+        return None
+
+    def on_import_excel(self):
+        path = filedialog.askopenfilename(
+            title="Selecione a planilha",
+            filetypes=[("Excel", "*.xlsx;*.xlsm;*.xltx;*.xltm"), ("Todos", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            wb = load_workbook(path, read_only=True, data_only=True)
+        except Exception as e:
+            messagebox.showerror("Excel", f"Não consegui abrir o arquivo:\n{e}")
+            return
+
+        # escolher aba
+        sheetnames = list(wb.sheetnames)
+        sheet = sheetnames[0] if len(sheetnames) == 1 else self._choose_from_list("Escolha a aba", sheetnames)
+        if not sheet:
+            return
+        ws = wb[sheet]
+
+        # detectar cabeçalhos
+        header_row, cols = self._find_header_row_and_map(ws)
+        c_data, c_mod, c_mat = cols["data"], cols["modalidade"], cols["materia"]
+
+        # varre linhas
+        new_items = {}
+        imported = 0
+        skipped = 0
+        overwritten = 0
+
+        for r in range(header_row + 1, ws.max_row + 1):
+            v_date = ws.cell(r, c_data).value
+            v_mod = ws.cell(r, c_mod).value
+            v_text = ws.cell(r, c_mat).value
+
+            key_date = self._fmt_date_ddmmyyyy(v_date)
+            suf = self._mod_to_suffix(v_mod)
+            text = (str(v_text).strip() if v_text is not None else "")
+
+            # regras de ignorar
+            if not key_date or not suf or not text:
+                skipped += 1
+                continue
+
+            key = f"{key_date} -{suf}"
+            if key in new_items:
+                overwritten += 1  # dentro do próprio lote
+            new_items[key] = text
+            imported += 1
+
+        wb.close()
+
+        # valida e normaliza com as regras já do app
+        norm, errors = validate_value_map(new_items)
+        if errors:
+            self._log("⚠ Erros ao validar itens importados:")
+            for k, e in errors.items():
+                self._log(f" - {k}: {e}")
+
+        # mescla com o que já tem (sobrescreve duplicadas)
+        dup_on_merge = sum(1 for k in norm if k in self.value_map)
+        self.value_map.update(norm)
+
+        # ordena por chave (opcional, ajuda na visualização)
+        self.value_map = dict(sorted(self.value_map.items(), key=lambda kv: kv[0]))
+
+        # UI
+        self._refresh_listbox()
+        self._validate_ready()
+
+        # logs
+        self._log("✔ Importação Excel concluída.")
+        self._log(f"   Arquivo: {path}")
+        self._log(f"   Aba: {sheet}")
+        self._log(f"   Itens válidos: {len(norm)} | Linhas ignoradas: {skipped} | Sobrescritas neste lote: {overwritten} | Sobrescritas na mesclagem: {dup_on_merge}")
+        self._log("   Preview:")
+        preview_count = 0
+        for k in list(norm.keys()):
+            self._log(f"   - {k}: {preview_text(norm[k])}")
+            preview_count += 1
+            if preview_count >= 5:
+                break
 
 
 def run():

@@ -1,6 +1,7 @@
 tk
 selenium
 webdriver-manager
-requests 
+requests
+openpyxl
 beautifulsoup4 
 lxml
