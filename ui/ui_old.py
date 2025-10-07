@@ -9,7 +9,8 @@ from tkinter import (
 )
 from tkinter import ttk
 from openpyxl import load_workbook
-import unicodedata, datetime, re
+import unicodedata, datetime, re, calendar
+
 
 from selenium.webdriver.remote.webdriver import WebDriver
 
@@ -18,6 +19,86 @@ from services.drivers import create_driver
 from services.utils import GET_URL, validate_value_map, preview_text
 from services.diario import get_current_turma_info, fill_entries, try_click_save
 from services.cookies import read_cookie_file, test_cookie_header
+
+# --- Helper drop-in: use Centerlevel(self) no lugar de Toplevel(self) ---
+def Centerlevel(parent, *, transient=True, grab=True, center_on_parent=True, topmost_pulse=True, **kwargs):
+    """
+    Cria um Toplevel e centraliza automaticamente quando aparecer.
+    Uso: win = Centerlevel(self)  # substitui Toplevel(self)
+    Parâmetros:
+      - transient: chama win.transient(parent) (fica acima do pai)
+      - grab:      chama win.grab_set() (modal)
+      - center_on_parent: True = centra na janela pai; False = centro da tela
+      - topmost_pulse: traz à frente rapidamente para evitar ficar atrás de outras janelas
+    """
+    win = Toplevel(parent, **kwargs)
+
+    if transient:
+        try: win.transient(parent)
+        except Exception: pass
+
+    # Não mostrar até posicionar
+    try: win.withdraw()
+    except Exception: pass
+
+    # Centralização (usa PlaceWindow se disponível; senão, calcula manual)
+    def _center_once():
+        try:
+            win.update_idletasks()
+            try:
+                # Tk 8.6+: centraliza de forma robusta
+                win.eval(f'tk::PlaceWindow {win.winfo_pathname(win.winfo_id())} center')
+                if center_on_parent:
+                    # PlaceWindow centra na tela; se quiser centrar no pai, faz manual:
+                    raise Exception("force-manual-parent-center")
+            except Exception:
+                # Fallback manual: centro no pai ou na tela
+                if center_on_parent and parent is not None:
+                    parent.update_idletasks()
+                    px, py = parent.winfo_rootx(), parent.winfo_rooty()
+                    pw, ph = parent.winfo_width(), parent.winfo_height()
+                    w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+                    if pw <= 1 or ph <= 1:  # pai ainda não medido
+                        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+                        x, y = (sw - w)//2, (sh - h)//2
+                    else:
+                        x, y = px + (pw - w)//2, py + (ph - h)//2
+                else:
+                    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+                    w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+                    x, y = (sw - w)//2, (sh - h)//2
+                win.geometry(f"+{x}+{y}")
+
+            # Mostrar após posicionar
+            try: win.deiconify()
+            except Exception: pass
+
+            # Traz à frente rapidamente
+            if topmost_pulse:
+                try:
+                    win.lift()
+                    win.attributes("-topmost", True)
+                    # solta o topmost para não “grudar” no topo
+                    win.after(10, lambda: win.attributes("-topmost", False))
+                except Exception:
+                    pass
+
+            # Modal
+            if grab:
+                try: win.grab_set()
+                except Exception: pass
+
+        except Exception:
+            # fallback final: mostra mesmo assim
+            try: win.deiconify()
+            except Exception: pass
+
+    # Centraliza quando a janela estiver pronta
+    # (chama duas vezes para capturar ajustes de layout tardios)
+    win.after(0, _center_once)
+    win.after(120, _center_once)
+
+    return win
 
 
 class App(Tk):
@@ -79,6 +160,9 @@ class App(Tk):
 
         self.btn_remove = Button(left_btns, text="Remove", command=self.on_remove_item)
         self.btn_remove.pack(side=LEFT, padx=4)
+
+        self.btn_shift = Button(left_btns, text="Ajustar datas (±)", command=self.on_shift_dates)
+        self.btn_shift.pack(side=LEFT, padx=4)
 
         self.btn_save_json = Button(left_btns, text="Salvar JSON", command=self.on_save_json)
         self.btn_save_json.pack(side=LEFT, padx=4)
@@ -158,7 +242,7 @@ class App(Tk):
     # ---------- CRUD dos itens ----------
     def _edit_dialog(self, initial_key: str, initial_text: str) -> Optional[tuple[str, str]]:
         """Modal simples para editar chave e texto; retorna (new_key, new_text) ou None."""
-        win = Toplevel(self)
+        win = Centerlevel(self)
         win.title("Editar item")
         win.transient(self)
         win.grab_set()
@@ -331,7 +415,7 @@ class App(Tk):
         """Modal simples com Combobox para escolher um item de options."""
         if not options:
             return None
-        win = Toplevel(self)
+        win = Centerlevel(self)
         win.title(title)
         win.transient(self); win.grab_set()
 
@@ -480,6 +564,256 @@ class App(Tk):
             if preview_count >= 5:
                 break
 
+    # ---------- Ajuste em massa das datas das chaves ----------
+    def _parse_key_date_suffix(self, key: str):
+        """Extrai (date, suffix) de 'DD/MM/AAAA -X...'. Retorna (datetime.date, 'X...') ou (None, None) se inválido."""
+        m = re.match(r"^\s*(\d{2})/(\d{2})/(\d{4})\s*-\s*(.+)\s*$", key or "")
+        if not m:
+            return None, None
+        d, mth, y, suf = m.groups()
+        try:
+            dt = datetime.date(int(y), int(mth), int(d))
+            return dt, suf.strip()
+        except Exception:
+            return None, None
+
+    def _last_day_of_month(self, year: int, month: int) -> int:
+        return calendar.monthrange(year, month)[1]
+
+    def _add_months(self, dt: datetime.date, n: int) -> datetime.date:
+        """Soma n meses (pode ser negativo). Ajusta para último dia do mês quando necessário."""
+        y = dt.year + (dt.month - 1 + n) // 12
+        m = (dt.month - 1 + n) % 12 + 1
+        d = min(dt.day, self._last_day_of_month(y, m))
+        return datetime.date(y, m, d)
+
+    def _add_years(self, dt: datetime.date, n: int) -> datetime.date:
+        """Soma n anos (pode ser negativo). Ajusta 29/fev para último dia do mês quando necessário."""
+        y = dt.year + n
+        m = dt.month
+        d = min(dt.day, self._last_day_of_month(y, m))
+        return datetime.date(y, m, d)
+
+    def _format_key(self, dt: datetime.date, suffix: str) -> str:
+        return f"{dt.strftime('%d/%m/%Y')} -{suffix}"
+
+    def on_shift_dates(self):
+        """Abre modal para escolher unidade e valor; aplica em todas as chaves."""
+        win = Centerlevel(self)
+        win.title("Ajustar datas das chaves")
+        win.transient(self)
+        win.grab_set()
+
+        # Unidade
+        Label(win, text="Unidade:").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+        unit_var = StringVar(value="Dias")
+        cbo = ttk.Combobox(win, textvariable=unit_var, values=["Dias", "Meses", "Anos"], state="readonly", width=12)
+        cbo.grid(row=0, column=1, sticky="w", padx=8, pady=(8, 4))
+
+        # Valor
+        Label(win, text="Valor (inteiro, pode ser negativo):").grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        val_var = StringVar(value="1")
+        ent = Entry(win, textvariable=val_var, width=12)
+        ent.grid(row=1, column=1, sticky="w", padx=8, pady=4)
+
+        # Botões
+        btns = Frame(win)
+        btns.grid(row=2, column=0, columnspan=2, sticky="e", padx=8, pady=8)
+
+        def _apply():
+            # valida entrada
+            try:
+                amount = int(val_var.get().strip())
+            except ValueError:
+                messagebox.showerror("Valor inválido", "Informe um inteiro (ex.: -7, 0, 15).")
+                return
+            unit = unit_var.get()
+
+            if not self.value_map:
+                messagebox.showinfo("Nada a ajustar", "Não há itens na lista.")
+                win.destroy()
+                return
+
+            # aplica transformações
+            new_map = {}
+            invalid = 0
+            changed = 0
+            overwritten = 0
+
+            for key, text in self.value_map.items():
+                dt, suf = self._parse_key_date_suffix(key)
+                if not dt:
+                    invalid += 1
+                    continue
+
+                if unit == "Dias":
+                    new_dt = dt + datetime.timedelta(days=amount)
+                elif unit == "Meses":
+                    new_dt = self._add_months(dt, amount)
+                else:  # "Anos"
+                    new_dt = self._add_years(dt, amount)
+
+                new_key = self._format_key(new_dt, suf)
+                if new_key in new_map:
+                    # colisão dentro do lote
+                    overwritten += 1
+                new_map[new_key] = text
+                changed += 1
+
+            # mescla no dicionário principal (sobrescreve se já existir)
+            # se preferir preservar os antigos, troque para: tmp = self.value_map.copy(); tmp.update(new_map); self.value_map = tmp
+            dup_on_merge = sum(1 for k in new_map if k in self.value_map and self.value_map.get(k) != new_map[k])
+            self.value_map.update(new_map)
+
+            # ordena para visualização
+            self.value_map = dict(sorted(self.value_map.items(), key=lambda kv: kv[0]))
+
+            # UI & logs
+            self._refresh_listbox()
+            self._validate_ready()
+            self._log(f"✔ Ajuste concluído: {changed} chaves alteradas | inválidas: {invalid} | sobrescritas no lote: {overwritten} | sobrescritas na mesclagem: {dup_on_merge}")
+            self._log(f"   Unidade: {unit} | Valor: {amount:+d}")
+            # preview
+            self._log("   Preview de 5 chaves após ajuste:")
+            count = 0
+            for k in self.value_map.keys():
+                self._log(f"   - {k}")
+                count += 1
+                if count >= 5:
+                    break
+
+            win.destroy()
+
+        def _cancel():
+            win.destroy()
+
+        Button(btns, text="Cancelar", command=_cancel).pack(side=RIGHT, padx=4)
+        Button(btns, text="Aplicar", command=_apply).pack(side=RIGHT, padx=4)
+
+        win.columnconfigure(0, weight=0)
+        win.columnconfigure(1, weight=1)
+        cbo.focus_set()
+        self.wait_window(win)
+
+    def on_shift_dates(self):
+        """Ajusta datas das chaves com filtro (Todas / só T / só P) e unidade (Dias/Meses/Anos)."""
+        win = Centerlevel(self)
+        win.title("Ajustar datas das chaves")
+        win.transient(self)
+        win.grab_set()
+
+        # Unidade
+        Label(win, text="Unidade:").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+        unit_var = StringVar(value="Dias")
+        cbo_unit = ttk.Combobox(win, textvariable=unit_var,
+                                values=["Dias", "Meses", "Anos"],
+                                state="readonly", width=12)
+        cbo_unit.grid(row=0, column=1, sticky="w", padx=8, pady=(8, 4))
+
+        # Valor
+        Label(win, text="Valor (inteiro, pode ser negativo):").grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        val_var = StringVar(value="1")
+        ent_val = Entry(win, textvariable=val_var, width=12)
+        ent_val.grid(row=1, column=1, sticky="w", padx=8, pady=4)
+
+        # Filtro (Todas / T / P)
+        Label(win, text="Aplicar em:").grid(row=2, column=0, sticky="w", padx=8, pady=4)
+        filt_var = StringVar(value="Todas")
+        cbo_filt = ttk.Combobox(win, textvariable=filt_var,
+                                values=["Todas", "Só T (Teóricas)", "Só P (Práticas)"],
+                                state="readonly", width=16)
+        cbo_filt.grid(row=2, column=1, sticky="w", padx=8, pady=4)
+
+        # Botões
+        btns = Frame(win)
+        btns.grid(row=3, column=0, columnspan=2, sticky="e", padx=8, pady=8)
+
+        def _apply():
+            # valida entrada
+            try:
+                amount = int(val_var.get().strip())
+            except ValueError:
+                messagebox.showerror("Valor inválido", "Informe um inteiro (ex.: -7, 0, 15).")
+                return
+            unit = unit_var.get()
+            filt = filt_var.get()  # "Todas" | "Só T (Teóricas)" | "Só P (Práticas)"
+
+            if not self.value_map:
+                messagebox.showinfo("Nada a ajustar", "Não há itens na lista.")
+                win.destroy()
+                return
+
+            # Transforma tudo criando um NOVO dicionário (evita duplicar antigas)
+            result_map = {}
+            changed = 0
+            invalid = 0
+            skipped_filter = 0
+            overwritten_lote = 0
+
+            for key, text in list(self.value_map.items()):
+                dt, suf_full = self._parse_key_date_suffix(key)
+                if not dt:
+                    # chave fora do padrão, mantém como está
+                    result_map[key] = text
+                    invalid += 1
+                    continue
+
+                suf_letter = self._suffix_letter(suf_full)  # P/T/…
+
+                # aplica filtro
+                if filt.startswith("Só T") and suf_letter != "T":
+                    result_map[key] = text
+                    skipped_filter += 1
+                    continue
+                if filt.startswith("Só P") and suf_letter != "P":
+                    result_map[key] = text
+                    skipped_filter += 1
+                    continue
+
+                # calcula nova data
+                if unit == "Dias":
+                    new_dt = dt + datetime.timedelta(days=amount)
+                elif unit == "Meses":
+                    new_dt = self._add_months(dt, amount)
+                else:  # "Anos"
+                    new_dt = self._add_years(dt, amount)
+
+                new_key = self._format_key(new_dt, suf_full)
+
+                if new_key in result_map:
+                    overwritten_lote += 1  # colisão dentro do resultado
+                result_map[new_key] = text
+                changed += 1
+
+            # aplica resultado
+            self.value_map = dict(sorted(result_map.items(), key=lambda kv: kv[0]))
+
+            # UI & logs
+            self._refresh_listbox()
+            self._validate_ready()
+            self._log(
+                f"✔ Ajuste concluído: {changed} alteradas | inválidas: {invalid} | filtradas: {skipped_filter} | "
+                f"sobrescritas no lote: {overwritten_lote}"
+            )
+            self._log(f"   Unidade: {unit} | Valor: {amount:+d} | Filtro: {filt}")
+            # preview
+            self._log("   Preview de 5 chaves após ajuste:")
+            for i, k in enumerate(self.value_map.keys()):
+                if i >= 5: break
+                self._log(f"   - {k}")
+
+            win.destroy()
+
+        def _cancel():
+            win.destroy()
+
+        Button(btns, text="Cancelar", command=_cancel).pack(side=RIGHT, padx=4)
+        Button(btns, text="Aplicar", command=_apply).pack(side=RIGHT, padx=4)
+
+        win.columnconfigure(0, weight=0)
+        win.columnconfigure(1, weight=1)
+        cbo_unit.focus_set()
+        self.wait_window(win)
 
 def run():
     app = App()
