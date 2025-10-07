@@ -7,3 +7,4 @@
 /Scripts
 /UFU_Diario_Preenchimento.spec
 /__pycache__
+*.spec
