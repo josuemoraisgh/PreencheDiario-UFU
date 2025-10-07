@@ -1,132 +1,168 @@
-# services/diario.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import Dict
+from typing import Callable, Tuple
 from selenium.webdriver.remote.webdriver import WebDriver
-import re
 
-# ---------- JS helpers em strings RAW (evita warnings por \s etc.) ----------
+# services/diario.py
+# ---------- JS helpers (corrigidos) ----------
 FIND_RELATED_TEXTAREA_JS = r"""
-const label = arguments[0];
+const KEY = arguments[0];
 
-function* textNodesUnder(el) {
-  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
-  let n;
-  while (n = walker.nextNode()) { yield n; }
+function norm(s){
+  if(!s) return '';
+  return s.toLowerCase()
+          .normalize('NFD').replace(/[\u0300-\u036f]/g,'')   // remove acentos
+          .replace(/[–—]/g,'-')                              // traços longos -> '-'
+          .replace(/\s+/g,' ')                               // espaços duplicados
+          .trim();
 }
-function normalize(s) { return (s || "").replace(/\s+/g, " ").trim(); }
+const key = norm(KEY);
 
-let candidates = [];
-for (const n of textNodesUnder(document.body)) {
-  const text = normalize(n.textContent);
-  if (text && text.includes(label)) {
-    let el = n.parentElement;
-    let depth = 0;
-    while (el && depth < 6) {
-      const ta = el.querySelector("textarea, [contenteditable='true']");
-      if (ta) { candidates.push(ta); break; }
-      el = el.parentElement;
-      depth++;
+// 1) Procurar *linhas* candidatas cujo texto contenha a chave
+const rowSelectors = ['tr', '.row', '.linha', '.form-group', 'li', '.item'];
+let rows = [];
+for (const sel of rowSelectors) {
+  rows = rows.concat(Array.from(document.querySelectorAll(sel)));
+}
+rows = rows.filter(el => {
+  try{
+    if (!el.offsetParent) return false;       // invisível
+    return norm(el.textContent || '').includes(key);
+  }catch(e){ return false; }
+});
+
+// 2) Dentro da própria linha, pegar o textarea
+for (const row of rows){
+  // caso simples: textarea dentro da mesma linha/bloco
+  const taInRow = row.querySelector('textarea');
+  if (taInRow) return taInRow;
+
+  // caso mais comum em tabela: a célula com a data está numa <td>, textarea na <td> seguinte
+  if (row.tagName === 'TR'){
+    const tds = Array.from(row.children);
+    // qual td contém a chave?
+    let idx = -1;
+    for (let i=0;i<tds.length;i++){
+      if (norm(tds[i].textContent || '').includes(key)) { idx = i; break; }
+    }
+    if (idx >= 0){
+      for (let j = idx+1; j < tds.length; j++){
+        const ta = tds[j].querySelector('textarea');
+        if (ta) return ta;
+      }
     }
   }
 }
-if (!candidates.length) {
-  const glob = document.querySelector("textarea, [contenteditable='true']");
-  if (glob) candidates.push(glob);
+
+// 3) Último recurso "perto da label": irmãos próximos (mas *não* sobe para table/tbody)
+const allLabels = Array.from(document.querySelectorAll('body *')).filter(el=>{
+  try{
+    if (!el.offsetParent) return false;
+    return norm(el.textContent || '').includes(key);
+  }catch(e){ return false; }
+});
+function findTextareaNear(el){
+  // procura nos irmãos diretos da label até uns passos
+  let sib = el.nextElementSibling;
+  for (let i=0; i<5 && sib; i++, sib = sib.nextElementSibling){
+    if (sib.tagName === 'TEXTAREA') return sib;
+    const inside = sib.querySelector ? sib.querySelector('textarea') : null;
+    if (inside) return inside;
+  }
+  // filhos diretos
+  const taChild = el.querySelector ? el.querySelector('textarea') : null;
+  if (taChild) return taChild;
+  return null; // sem fallback global
 }
-return candidates.length ? candidates[0] : null;
+for (const el of allLabels){
+  const ta = findTextareaNear(el);
+  if (ta) return ta;
+}
+
+return null;
 """
 
-SET_TEXTAREA_VALUE_JS = r"""
-const el = arguments[0];
-const text = arguments[1];
-function setValue(elem, value) {
-  if (!elem) return;
-  const isTA = elem.tagName && elem.tagName.toLowerCase() === "textarea";
-  if (isTA) {
-    elem.focus();
-    elem.value = value;
-    elem.dispatchEvent(new Event("input", { bubbles: true }));
-    elem.dispatchEvent(new Event("change", { bubbles: true }));
-  } else if (elem.isContentEditable) {
-    elem.focus();
-    elem.innerText = value;
-    elem.dispatchEvent(new Event("input", { bubbles: true }));
-    elem.dispatchEvent(new Event("change", { bubbles: true }));
-  }
+FILL_TEXTAREA_JS = r"""
+const ta = arguments[0];
+const text = arguments[1] || '';
+const highlight = !!arguments[2];
+
+try { ta.scrollIntoView({behavior:'auto', block:'center', inline:'nearest'}); } catch(e) {}
+
+ta.focus();
+ta.value = text;
+ta.dispatchEvent(new Event('input', {bubbles:true}));
+ta.dispatchEvent(new Event('change', {bubbles:true}));
+
+if (highlight){
+  const oldOutline = ta.style.outline;
+  ta.style.outline = '3px solid orange';
+  setTimeout(()=>{ ta.style.outline = oldOutline; }, 800);
 }
-setValue(el, text);
 return true;
 """
 
 CLICK_SAVE_BUTTON_JS = r"""
-const labels = ["Salvar", "Gravar", "Salvar/Gravar", "Salvar Diário", "Gravar Diário"];
-function norm(s){ return (s||"").replace(/\s+/g," ").trim().toLowerCase(); }
-function matchLabel(el){
-  const t = norm(el.innerText || el.value || el.getAttribute("title") || "");
-  return labels.map(x=>x.toLowerCase()).some(l => t.includes(l));
-}
-let btn = null;
-const selectors = ["button", "input[type='button']", "input[type='submit']", "[role='button']"];
-for (const sel of selectors) {
-  for (const el of document.querySelectorAll(sel)) {
-    if (matchLabel(el)) { btn = el; break; }
-  }
-  if (btn) break;
-}
-if (!btn) { btn = document.querySelector("button, [role='button'], input[type='submit']"); }
-if (btn) { btn.click(); return true; }
-return false;
+// (deixe sua lógica de localizar o botão Salvar/Gravar como já estava)
 """
 
-def get_current_turma_info(driver: WebDriver):
-    """Tenta extrair (idTurma, tipo) pela URL ou por inputs hidden."""
-    url = driver.current_url or ""
-    m = re.search(r"[?&]idTurma=([^&#]+)", url)
-    n = re.search(r"[?&]tipo=([^&#]+)", url)
-    if m and n:
-        return m.group(1), n.group(1)
+# ---------- API usada pela UI ----------
 
-    # fallback DOM seguro (sem quebrar aspas do Python)
-    try:
-        id_turma = driver.execute_script(
-            r"""const el = document.querySelector('[name="idTurma"]'); return el ? el.value : null;"""
-        )
-        tipo = driver.execute_script(
-            r"""const el = document.querySelector('[name="tipo"]'); return el ? el.value : null;"""
-        )
-        if id_turma and tipo:
-            return str(id_turma), str(tipo)
-    except Exception:
-        pass
-
-    return None
-
-def fill_entries(driver: WebDriver, value_map: Dict[str, str], logger):
-    """Percorre o dict {label: texto} e tenta preencher o textarea relacionado."""
+def fill_entries(
+    driver: WebDriver,
+    value_map: dict[str, str],
+    logger: Callable[[str], None],
+    *,
+    strict: bool = True,          # agora padrão estrito: NÃO usa fallback global
+    require_empty: bool = False,  # se True, pula campos que já têm conteúdo
+    highlight: bool = True,       # destaca o campo preenchido
+) -> Tuple[int, int, int]:
+    """
+    Preenche item-a-item. Retorna (ok, nao_encontradas, pulado_ja_preenchido).
+    - strict=True: não preenche se não localizar textarea relacionado.
+    - require_empty=True: só preenche se o textarea estiver vazio (evita sobrescrever).
+    """
     ok = 0
-    fail = 0
-    for label, text in value_map.items():
-        logger(f"→ Preenchendo: {label}")
-        try:
-            el = driver.execute_script(FIND_RELATED_TEXTAREA_JS, label)
-            if el:
-                driver.execute_script(SET_TEXTAREA_VALUE_JS, el, text)
-                logger("   ok")
-                ok += 1
-            else:
-                logger(f"   não encontrei textarea para {label!r}")
-                fail += 1
-        except Exception as e:
-            logger(f"   erro: {e}")
-            fail += 1
-    return ok, fail
+    not_found = 0
+    skipped_filled = 0
 
-def try_click_save(driver: WebDriver, logger):
-    """Tenta localizar e clicar um botão de Salvar/Gravar."""
+    # IMPORTANTE: garantir ordem por chave já vem da UI; aqui iteramos na ordem recebida
+    for k, v in value_map.items():
+        logger(f"→ Preenchendo: {k}")
+        try:
+            # procura textarea relacionado à label/data
+            textarea = driver.execute_script(FIND_RELATED_TEXTAREA_JS, k)
+            if not textarea:
+                logger(f"   não encontrei textarea para '{k}'")
+                not_found += 1
+                continue  # STRICT: não tenta fallback algum
+
+            if require_empty:
+                current = driver.execute_script("return arguments[0].value || '';", textarea) or ""
+                if str(current).strip():
+                    logger("   pulado (já havia conteúdo)")
+                    skipped_filled += 1
+                    continue
+
+            # preencher + eventos + highlight
+            driver.execute_script(FILL_TEXTAREA_JS, textarea, v, highlight)
+            logger("   ok")
+            ok += 1
+
+        except Exception as e:
+            # qualquer erro neste item não deve contaminar os demais
+            logger(f"   erro: {e}")
+            not_found += 1  # contabiliza como falho/não preenchido
+
+    return ok, not_found, skipped_filled
+
+
+def try_click_save(driver: WebDriver, logger: Callable[[str], None]) -> None:
     try:
-        res = driver.execute_script(CLICK_SAVE_BUTTON_JS)
-        logger("Cliquei em Salvar/Gravar." if res else "Não localizei botão Salvar/Gravar.")
-        return bool(res)
+        clicked = driver.execute_script(CLICK_SAVE_BUTTON_JS)
+        if clicked:
+            logger("Cliquei em Salvar/Gravar.")
+        else:
+            logger("Não localizei botão Salvar/Gravar.")
     except Exception as e:
-        logger(f"Erro ao tentar salvar: {e}")
-        return False
+        logger(f"Falha ao tentar salvar: {e}")

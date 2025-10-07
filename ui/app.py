@@ -12,7 +12,7 @@ from selenium.webdriver.remote.webdriver import WebDriver
 # project services (já existentes no seu projeto)
 from services.drivers import create_driver
 from services.utils import GET_URL, validate_value_map, preview_text
-from services.diario import get_current_turma_info, fill_entries, try_click_save
+from services.diario import fill_entries, try_click_save
 
 # ui & features
 from ui.dialogs import ask_edit_item, choose_from_list, ask_shift_params
@@ -249,10 +249,6 @@ class App(Tk):
 
         def _run():
             try:
-                info = get_current_turma_info(self.driver)
-                if not info:
-                    self._log("⚠ Não consegui detectar idTurma/tipo na página atual. Abra a página do diário e tente novamente.")
-                    return
                 self._log("Iniciando preenchimento visual...")
                 ok, fail = fill_entries(self.driver, self.value_map, self._log)
                 try_click_save(self.driver, self._log)
