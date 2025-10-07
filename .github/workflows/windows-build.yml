@@ -15,7 +15,6 @@ permissions:
 jobs:
   build-win:
     runs-on: windows-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -57,29 +56,29 @@ jobs:
           if (Test-Path dist)  { Remove-Item dist  -Recurse -Force }
           New-Item -ItemType Directory -Force -Path build | Out-Null
 
-          @"
-import os
-import PyInstaller.__main__ as P
-
-ver   = os.environ.get("APP_VER", "dev")
-name  = f"UFU-PreencheDiario-{ver}"
-entry = os.environ.get("ENTRY", "main.py")
-
-# se existir .spec na raiz, usamos ele; caso contrário, build do script
-specs = [f for f in os.listdir(".") if f.lower().endswith(".spec")]
-if specs:
-    print(">> Building from SPEC:", specs[0])
-    P.run([specs[0]])
-else:
-    print(">> Building from script:", entry)
-    opts = ["--noconfirm","--clean","--onefile","--windowed","-n", name]
-    ico = os.path.join("assets","app.ico")
-    if os.path.exists(ico):
-        opts += ["-i", ico]
-    opts += [entry]
-    print("PyInstaller opts:", opts)
-    P.run(opts)
-"@ | Set-Content -Path build/run_pyi.py -Encoding UTF8
+          $lines = @(
+            'import os'
+            'import PyInstaller.__main__ as P'
+            ''
+            'ver   = os.environ.get("APP_VER", "dev")'
+            'name  = f"UFU-PreencheDiario-{ver}"'
+            'entry = os.environ.get("ENTRY", "main.py")'
+            ''
+            'specs = [f for f in os.listdir(".") if f.lower().endswith(".spec")]'
+            'if specs:'
+            '    print(">> Building from SPEC:", specs[0])'
+            '    P.run([specs[0]])'
+            'else:'
+            '    print(">> Building from script:", entry)'
+            '    opts = ["--noconfirm","--clean","--onefile","--windowed","-n", name]'
+            '    ico = os.path.join("assets","app.ico")'
+            '    if os.path.exists(ico):'
+            '        opts += ["-i", ico]'
+            '    opts += [entry]'
+            '    print("PyInstaller opts:", opts)'
+            '    P.run(opts)'
+          )
+          $lines | Set-Content -Path build/run_pyi.py -Encoding UTF8
 
           python build/run_pyi.py
 
