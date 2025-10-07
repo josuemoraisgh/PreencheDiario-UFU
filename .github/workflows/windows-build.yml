@@ -1,0 +1,76 @@
+name: Windows EXE (PyInstaller)
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]        # publicar release quando criar tag vX.Y.Z
+  workflow_dispatch:       # botão "Run workflow" manual
+
+permissions:
+  contents: write          # necessário para criar Release em tags
+
+jobs:
+  build-win:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          if (Test-Path "requirements.txt") {
+            pip install -r requirements.txt
+          }
+          # ferramentas de empacotamento (recomendado para tkinter/openpyxl/selenium)
+          pip install pyinstaller pyinstaller-hooks-contrib
+
+      - name: Compute version
+        shell: pwsh
+        run: |
+          if ("${{ github.ref }}".StartsWith("refs/tags/")) {
+            $ver = "${{ github.ref_name }}"        # ex: v1.2.3
+          } else {
+            $ver = "dev-${{ github.run_number }}"
+          }
+          "APP_VER=$ver" >> $env:GITHUB_ENV
+
+      - name: Build EXE with PyInstaller
+        shell: pwsh
+        run: |
+          # opcional: usar ícone se existir em assets/app.ico
+          if (Test-Path "assets\app.ico") { $ico = "-i assets\app.ico" } else { $ico = "" }
+
+          # Garante ambiente limpo
+          if (Test-Path build) { Remove-Item build -Recurse -Force }
+          if (Test-Path dist)  { Remove-Item dist  -Recurse -Force }
+
+          # Compile (GUI: --windowed). Entry point = main.py (ajuste se for outro)
+          pyinstaller --noconfirm --clean --onefile --windowed $ico `
+            -n "UFU-PreencheDiario" main.py
+
+          # Renomeia com versão
+          Copy-Item "dist\UFU-PreencheDiario.exe" "dist\UFU-PreencheDiario-$env:APP_VER.exe"
+
+      - name: Upload artifact (.exe)
+        uses: actions/upload-artifact@v4
+        with:
+          name: UFU-PreencheDiario-${{ env.APP_VER }}-win
+          path: dist/UFU-PreencheDiario-${{ env.APP_VER }}.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/UFU-PreencheDiario-${{ env.APP_VER }}.exe
+          generate_release_notes: true
