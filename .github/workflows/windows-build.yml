@@ -3,11 +3,11 @@ name: Windows EXE (PyInstaller)
 on:
   push:
     branches: [ main, master ]
-    tags: [ 'v*' ]        # publicar release quando criar tag vX.Y.Z
-  workflow_dispatch:       # botão "Run workflow" manual
+    tags: [ 'v*' ]
+  workflow_dispatch:
 
 permissions:
-  contents: write          # necessário para criar Release em tags
+  contents: write
 
 jobs:
   build-win:
@@ -31,7 +31,6 @@ jobs:
           if (Test-Path "requirements.txt") {
             pip install -r requirements.txt
           }
-          # ferramentas de empacotamento (recomendado para tkinter/openpyxl/selenium)
           pip install pyinstaller pyinstaller-hooks-contrib
 
       - name: Compute version
@@ -42,24 +41,45 @@ jobs:
           } else {
             $ver = "dev-${{ github.run_number }}"
           }
-          "APP_VER=$ver" >> $env:GITHUB_ENV
+          "APP_VER=$ver" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Locate entry point
+        id: entry
+        shell: pwsh
+        run: |
+          # Procura main.py em locais comuns
+          $candidates = @(
+            "main.py",
+            "refactor_ui_single_responsibility\main.py",
+            "src\main.py",
+            "app\main.py"
+          )
+          $entry = $null
+          foreach ($c in $candidates) { if (Test-Path $c) { $entry = $c; break } }
+          if (-not $entry) {
+            Write-Host "Conteúdo do repositório:"
+            Get-ChildItem -Recurse -Depth 3 | Select-Object -First 200 | Format-Table
+            throw "Não encontrei o entry point (main.py). Ajuste a lista de candidatos neste passo."
+          }
+          "ENTRY=$entry" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "ENTRY => $entry"
 
       - name: Build EXE with PyInstaller
         shell: pwsh
         run: |
-          # opcional: usar ícone se existir em assets/app.ico
-          if (Test-Path "assets\app.ico") { $ico = "-i assets\app.ico" } else { $ico = "" }
-
-          # Garante ambiente limpo
           if (Test-Path build) { Remove-Item build -Recurse -Force }
           if (Test-Path dist)  { Remove-Item dist  -Recurse -Force }
 
-          # Compile (GUI: --windowed). Entry point = main.py (ajuste se for outro)
-          pyinstaller --noconfirm --clean --onefile --windowed $ico `
-            -n "UFU-PreencheDiario" main.py
+          # usa ícone se existir
+          $ico = ""
+          if (Test-Path "assets\app.ico") { $ico = "-i assets\app.ico" }
 
-          # Renomeia com versão
-          Copy-Item "dist\UFU-PreencheDiario.exe" "dist\UFU-PreencheDiario-$env:APP_VER.exe"
+          # chame SEMPRE via módulo para evitar wrappers estranhos
+          python -m PyInstaller --noconfirm --clean --onefile --windowed $ico `
+            -n "UFU-PreencheDiario-$env:APP_VER" "${{ env.ENTRY }}"
+
+          Write-Host "Dist contents:"
+          Get-ChildItem dist -Recurse | Format-Table -AutoSize
 
       - name: Upload artifact (.exe)
         uses: actions/upload-artifact@v4
