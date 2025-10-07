@@ -1,0 +1,6 @@
+tk
+selenium
+webdriver-manager
+requests 
+beautifulsoup4 
+lxml

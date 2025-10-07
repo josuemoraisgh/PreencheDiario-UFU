@@ -1,0 +1,9 @@
+/.venv
+/build
+/dist
+/Include
+/Lib
+/pyvenv.cfg
+/Scripts
+/UFU_Diario_Preenchimento.spec
+/__pycache__
